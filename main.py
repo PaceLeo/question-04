@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-桌面小宠物（纯 tkinter 实现，无第三方依赖）—— 修复版
+桌面小宠物 v3 —— 带「应用感知」
 
-修复：
-  1) 浮点坐标导致 wm_geometry 报 "bad geometry specifier"，进而让动画循环崩溃
-     → 所有 geometry 参数统一取整
-  2) 右键菜单 emoji 超出 Tcl 的 BMP 范围（U+0000~U+FFFF）
-     → 菜单改为纯文本
-  3) _tick 加 try/finally，单帧异常不会终止动画
+在 v2（已修坐标浮点 & emoji 问题）基础上新增：
+  · 定时读取当前前台窗口的进程名/窗口标题（Win32 API，零依赖）
+  · 根据焦点应用（浏览器 / 编辑器 / 聊天 / 终端 / 办公 / 桌面…）说不同的话
+  · 切换应用 → 触发首次反应；久待同一应用 → 偶尔闲聊
+  · 右键菜单可开关「应用感知」
+  · 非 Windows 平台自动禁用该能力，其余功能不受影响
 """
 
+import os
 import math
 import random
 import platform
@@ -18,27 +19,183 @@ import time
 import traceback
 import tkinter as tk
 
-# ---------------- 配置 ----------------
-TRANS = "#FF00FE"              # Windows 透明色
+# ==================== 平台 / Win32 API ====================
+IS_WIN = platform.system() == "Windows"
+
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+    _user32.GetWindowTextLengthW.restype = ctypes.c_int
+    _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
+    _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    _kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def _get_foreground():
+        """返回 (pid, exe名小写, 窗口标题)；失败返回 (None, None, None)"""
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return None, None, None
+
+        pid = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+        length = _user32.GetWindowTextLengthW(hwnd)
+        title_buf = ctypes.create_unicode_buffer(length + 1)
+        _user32.GetWindowTextW(hwnd, title_buf, length + 1)
+        title = title_buf.value
+
+        exe = None
+        h = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if h:
+            try:
+                size = wintypes.DWORD(1024)
+                path_buf = ctypes.create_unicode_buffer(1024)
+                if _kernel32.QueryFullProcessImageNameW(h, 0, path_buf, ctypes.byref(size)):
+                    exe = path_buf.value.rsplit("\\", 1)[-1].lower()
+            finally:
+                _kernel32.CloseHandle(h)
+
+        return pid.value, exe, title
+
+else:
+    def _get_foreground():
+        return None, None, None
+
+
+# ==================== 应用规则表 ====================
+# exe：精确匹配的小写进程名
+# first：切到这个应用时说的话
+# idle：在这个应用上待久了偶尔说的话
+APP_RULES = [
+    {
+        "exe": ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+                "360se.exe", "qqbrowser.exe"),
+        "name": "浏览器",
+        "first": ["又在上网冲浪呀～", "网上有什么好玩的？", "别刷太久啦～"],
+        "idle": ["眼睛累了吧，看看远方～", "记得喝水哦～", "要不要回来摸摸我？"],
+    },
+    {
+        "exe": ("code.exe", "code - insiders.exe", "pycharm64.exe", "pycharm.exe",
+                "idea64.exe", "devenv.exe", "sublime_text.exe", "notepad++.exe",
+                "vim.exe", "nvim.exe"),
+        "name": "代码编辑器",
+        "first": ["写代码啦！加油～", "又双叒叕在 debug？", "这个 bug 一定能搞定！"],
+        "idle": ["记得保存哦！", "这段代码一定很酷～", "肩膀放松一下～", "Ctrl+S 按了吗？"],
+    },
+    {
+        "exe": ("cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "mintty.exe",
+                "bash.exe", "windowsterminal.exe", "wt.exe"),
+        "name": "终端",
+        "first": ["黑客时间到！", "命令行大佬～", "又在敲命令呀"],
+        "idle": ["sudo 加权限！", "小心 rm -rf 哦～", "又卡住了？"],
+    },
+    {
+        "exe": ("wechat.exe", "weixin.exe", "qq.exe", "tim.exe", "telegram.exe",
+                "dingtalk.exe", "feishu.exe", "lark.exe", "discord.exe", "slack.exe"),
+        "name": "聊天软件",
+        "first": ["在聊天呀～", "别聊太久哦", "有人找我吗？"],
+        "idle": ["我也想参与！", "聊什么呢？", "记得回我消息～"],
+    },
+    {
+        "exe": ("winword.exe", "excel.exe", "powerpnt.exe", "wps.exe", "et.exe",
+                "wpp.exe", "acrobat.exe"),
+        "name": "办公软件",
+        "first": ["在忙工作呀～", "文档写得怎么样啦？", "又要做表格…"],
+        "idle": ["辛苦啦～", "记得多喝水", "做完记得休息"],
+    },
+    {
+        "exe": ("vlc.exe", "potplayermini64.exe", "potplayermini.exe",
+                "mpc-hc64.exe", "wmplayer.exe", "bilibili.exe", "iqiyi.exe", "youku.exe"),
+        "name": "视频播放器",
+        "first": ["看电影呀！我也要看～", "剧情怎么样？", "偷偷摸鱼被发现啦"],
+        "idle": ["好看吗？", "别剧透哦～"],
+    },
+    {
+        "exe": ("steam.exe", "epicgameslauncher.exe", "origin.exe", "uplay.exe", "wegame.exe"),
+        "name": "游戏平台",
+        "first": ["要玩游戏了吗？", "带我一起玩～", "游戏时间到！"],
+        "idle": ["赢了吗？", "别玩太晚哦～"],
+    },
+    {
+        "exe": ("spotify.exe", "cloudmusic.exe", "qqmusic.exe", "kugou.exe", "foobar2000.exe"),
+        "name": "音乐软件",
+        "first": ["听歌呀～", "什么歌这么好听？"],
+        "idle": ["我也要听～", "单曲循环了吗？"],
+    },
+    {
+        "exe": ("explorer.exe",),
+        "name": "文件管理器",
+        "first": ["在翻文件呀～", "找什么呢？"],
+        "idle": ["要不要整理一下桌面？"],
+    },
+    {
+        "exe": ("notepad.exe",),
+        "name": "记事本",
+        "first": ["记事本写啥呢？", "在记笔记呀～"],
+        "idle": ["记得保存～"],
+    },
+    {
+        "exe": ("taskmgr.exe",),
+        "name": "任务管理器",
+        "first": ["电脑卡了吗？", "别关掉我呀！", "别看我占多少内存…"],
+        "idle": ["我占的可不多！"],
+    },
+    {
+        "exe": ("desktop",),
+        "name": "桌面",
+        "first": ["在桌面上发呆呀～", "好安静～"],
+        "idle": ["陪我玩一会儿嘛～", "戳戳我呀～"],
+    },
+]
+
+
+def match_app(exe):
+    if not exe:
+        return None
+    for rule in APP_RULES:
+        if exe in rule["exe"]:
+            return rule
+    return None
+
+
+# ==================== 配置 ====================
+TRANS = "#FF00FE"
 FONT = ("Microsoft YaHei", 11)
-FPS_MS = 45                    # 每帧毫秒数
-WALK_SPEED = 3.2               # 走动速度 px/帧（浮点，累加后统一取整）
+FPS_MS = 45
+WALK_SPEED = 3.2
+CHECK_INTERVAL = 30          # 每 30 帧（约 1.35s）读一次前台应用
 
 CLICK_TALK = [
-    "哎呀，别戳我～",
-    "痒痒的！",
-    "你好呀！",
-    "在呢在呢～",
-    "要摸摸头吗？",
-    "嘿！我在工作呢～",
+    "哎呀，别戳我～", "痒痒的！", "你好呀！", "在呢在呢～",
+    "要摸摸头吗？", "嘿！我在工作呢～",
 ]
 CHAT = [
-    "今天也要加油哦！",
-    "记得喝水呀～",
-    "坐久了要起来动一动",
-    "我陪你一起～",
-    "嘿嘿～",
-    "天气怎么样呀？",
+    "今天也要加油哦！", "记得喝水呀～", "坐久了要起来动一动",
+    "我陪你一起～", "嘿嘿～", "天气怎么样呀？",
 ]
 
 
@@ -52,7 +209,7 @@ class DesktopPet:
         self.root.attributes("-topmost", True)
 
         bg = TRANS
-        if platform.system() == "Windows":
+        if IS_WIN:
             self.root.configure(bg=TRANS)
             try:
                 self.root.wm_attributes("-transparentcolor", TRANS)
@@ -73,13 +230,13 @@ class DesktopPet:
 
         self.x = self.sw - self.W - 100
         self.y = self.sh - self.H - 90
-        # 注意：初始也用 int，和后续保持一致
         self.root.geometry(f"{self.W}x{self.H}+{int(self.x)}+{int(self.y)}")
 
         self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
                                 bg=bg, highlightthickness=0, bd=0)
         self.canvas.pack()
 
+        # 动画状态
         self.facing = -1
         self.mode = "idle"
         self.phase = 0.0
@@ -92,21 +249,24 @@ class DesktopPet:
         self.talk_until = 0.0
         self.dragging = False
         self._moved = 0
-        self._err_shown = False   # 防止异常刷屏
+        self._err_shown = False
+
+        # 应用感知状态
+        self.my_pid = os.getpid()
+        self.app_aware = IS_WIN
+        self._check_cd = 0
+        self.cur_app = None       # {"exe":..., "rule":..., "since":...}
+        self.idle_cd = 0          # 帧
 
         self._build()
         self._bind()
 
-    # ==================== 绘制图元 ====================
+    # ==================== 绘制 ====================
     def _build(self):
         c = self.canvas
         it = self.it = {}
-
-        OUT = "#C98A3E"
-        BODY = "#FFC97A"
-        INNER = "#FF9B9B"
-        EYE = "#3A2A20"
-        BLUSH = "#FFA6B8"
+        OUT, BODY, INNER = "#C98A3E", "#FFC97A", "#FF9B9B"
+        EYE, BLUSH = "#3A2A20", "#FFA6B8"
 
         it["tail_o"] = c.create_line(0, 0, 0, 0, 0, 0, smooth=True, width=16,
                                      fill=OUT, capstyle="round", joinstyle="round")
@@ -120,7 +280,6 @@ class DesktopPet:
 
         it["foot_l"] = c.create_oval(0, 0, 0, 0, fill=BODY, outline=OUT, width=3)
         it["foot_r"] = c.create_oval(0, 0, 0, 0, fill=BODY, outline=OUT, width=3)
-
         it["body"] = c.create_oval(0, 0, 0, 0, fill=BODY, outline=OUT, width=3)
 
         it["eye_l"] = c.create_oval(0, 0, 0, 0, fill=EYE, outline="")
@@ -152,7 +311,6 @@ class DesktopPet:
             (x1, y2), (x1, y2 - r), (x1, y1 + r), (x1, y1),
         ]
 
-    # ==================== 渲染 ====================
     def _render(self):
         c, it = self.canvas, self.it
         mir = self.facing < 0
@@ -173,7 +331,6 @@ class DesktopPet:
             fr = max(0.0, -math.sin(self.phase)) * 7
         else:
             fl = fr = 0.0
-
         b = bob
 
         tail = [(150, 206 + b), (190, 200 + b), (198 + tw, 174 + b), (184 + tw, 158 + b)]
@@ -187,7 +344,6 @@ class DesktopPet:
 
         set_("foot_l", [(78, 222 - fl), (106, 244 - fl)])
         set_("foot_r", [(114, 222 - fr), (142, 244 - fr)])
-
         set_("body", [(58, 124 + b), (162, 234 + b)])
 
         if self.blinking:
@@ -238,13 +394,10 @@ class DesktopPet:
         dx = e.x_root - self._press[0]
         dy = e.y_root - self._press[1]
         self._moved = max(self._moved, abs(dx) + abs(dy))
-        # 注意：拖动时 x/y 可能是浮点（因为走动把 self.x 变成了浮点），
-        # 先算好再统一取整
         self.x = self._win[0] + dx
         self.y = self._win[1] + dy
         self.x = max(-20, min(self.x, self.sw - self.W + 20))
         self.y = max(-10, min(self.y, self.sh - self.H + 10))
-        # ★ 关键修复：geometry 只接受整数
         self.root.geometry(f"+{int(round(self.x))}+{int(round(self.y))}")
 
     def _on_release(self, e):
@@ -256,10 +409,12 @@ class DesktopPet:
 
     def _on_menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
-        # ★ 关键修复：去掉 emoji（U+1F4AC 等超出 Tcl BMP 范围）
         m.add_command(label="说句话",   command=lambda: self.say(random.choice(CLICK_TALK)))
         m.add_command(label="走一走",   command=self.start_walk)
         m.add_command(label="休息一下", command=self.rest)
+        m.add_separator()
+        aware_txt = "应用感知：开" if self.app_aware else "应用感知：关"
+        m.add_command(label=aware_txt,  command=self._toggle_aware)
         m.add_separator()
         m.add_command(label="退出",     command=self.root.destroy)
         try:
@@ -273,6 +428,12 @@ class DesktopPet:
         self.talk_until = time.time() + dur
         self.canvas.itemconfigure(self.it["b_text"], text=text)
 
+    def _speak(self, text, dur=2.6):
+        """应用感知专用：正在说话就不打断"""
+        if self.talking:
+            return
+        self.say(text, dur)
+
     def start_walk(self):
         self.mode = "walk"
         self.facing = random.choice((-1, 1))
@@ -282,6 +443,46 @@ class DesktopPet:
         self.mode = "idle"
         self.timer = random.randint(120, 260)
         self.say("呼…休息一下～", 2.0)
+
+    def _toggle_aware(self):
+        self.app_aware = not self.app_aware
+        if not self.app_aware:
+            self.cur_app = None
+        self.say("应用感知已" + ("开启" if self.app_aware else "关闭"), 1.8)
+
+    # ---------- 应用感知核心 ----------
+    def _poll_foreground(self):
+        try:
+            pid, exe, title = _get_foreground()
+        except Exception:
+            return
+        if not exe:
+            return
+        if pid == self.my_pid:      # 焦点在自己身上（拖拽时可能发生），忽略
+            return
+
+        # explorer.exe 也可能是桌面，需要看标题来区分
+        if exe == "explorer.exe" and title in ("", "Program Manager", "桌面"):
+            exe = "desktop"
+
+        rule = match_app(exe)
+        if rule is None:
+            self.cur_app = None
+            return
+
+        if self.cur_app is None or self.cur_app["exe"] != exe:
+            # —— 切换到新应用 ——
+            self.cur_app = {"exe": exe, "rule": rule, "since": time.time()}
+            self.idle_cd = random.randint(300, 600)      # 首次说完后 ~13~27s 内不闲聊
+            self._speak(random.choice(rule["first"]), 3.0)
+        else:
+            # —— 停留同一应用，偶尔闲聊 ——
+            self.idle_cd -= CHECK_INTERVAL
+            if self.idle_cd <= 0:
+                self.idle_cd = random.randint(400, 800)
+                idle_lines = rule.get("idle") or []
+                if idle_lines and random.random() < 0.55:
+                    self._speak(random.choice(idle_lines), 2.6)
 
     # ==================== 主循环 ====================
     def _update(self):
@@ -311,7 +512,7 @@ class DesktopPet:
                 else:
                     self.start_walk()
                     if random.random() < 0.3:
-                        self.say(random.choice(CHAT))
+                        self._speak(random.choice(CHAT))
 
         if self.mode == "walk" and not self.dragging:
             self.x += WALK_SPEED * self.facing
@@ -321,16 +522,21 @@ class DesktopPet:
             elif self.x > self.sw - self.W:
                 self.x = self.sw - self.W
                 self.facing = -1
-            # ★ 关键修复：int 化，避免 "bad geometry specifier"
             self.root.geometry(f"+{int(round(self.x))}+{int(round(self.y))}")
             self.phase += 0.38
         else:
             self.phase += 0.09
 
+        # ---- 应用感知轮询 ----
+        if self.app_aware:
+            self._check_cd -= 1
+            if self._check_cd <= 0:
+                self._check_cd = CHECK_INTERVAL
+                self._poll_foreground()
+
         self._render()
 
     def _tick(self):
-        # ★ 关键修复：即使单帧出现异常，动画也能继续，宠物不会卡死
         try:
             self._update()
         except Exception:
